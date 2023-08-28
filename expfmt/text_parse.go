@@ -51,18 +51,17 @@ func (e ParseError) Error() string {
 // zero value is ready to use.
 type TextParser struct {
 	metricFamiliesByName map[string]*dto.MetricFamily
-
-	buf *bufio.Reader // Where the parsed input is read through.
-
-	err              error // Most recent error.
-	lineCount        int   // Tracks the line count for error messages.
-	batchSize        int
-	batchCallback    BatchCallback
-	currentByte      byte         // The most recent byte read.
-	currentToken     bytes.Buffer // Re-used each time a token has to be gathered from multiple bytes.
-	currentMF        *dto.MetricFamily
-	currentMetric    *dto.Metric
-	currentLabelPair *dto.LabelPair
+	buf                  *bufio.Reader // Where the parsed input is read through.
+	err                  error         // Most recent error.
+	lineCount            int           // Tracks the line count for error messages.
+	batchSize            int
+	batchCallback        BatchCallback
+	previousByte         byte         // The most recent byte read.
+	currentByte          byte         // The most recent byte read.
+	currentToken         bytes.Buffer // Re-used each time a token has to be gathered from multiple bytes.
+	currentMF            *dto.MetricFamily
+	currentMetric        *dto.Metric
+	currentLabelPair     *dto.LabelPair
 
 	// The remaining member variables are only used for summaries/histograms.
 	currentLabels map[string]string // All labels including '__name__' but excluding 'quantile'/'le'
@@ -133,6 +132,7 @@ func NewTextParser(opts ...textParserOpt) *TextParser {
 // input concurrently, instantiate a separate Parser for each goroutine.
 func (p *TextParser) TextToMetricFamilies(in io.Reader) (map[string]*dto.MetricFamily, error) {
 	p.reset(in)
+
 	for nextState := p.startOfLine; nextState != nil; nextState = nextState() {
 		// Magic happens here...
 	}
@@ -158,6 +158,9 @@ func (p *TextParser) StreamingParse(in io.Reader) error {
 	if err != nil {
 		return err
 	}
+
+	// clear memory
+	p.metricFamiliesByName = map[string]*dto.MetricFamily{}
 
 	return p.batchCallback(mfs)
 }
@@ -202,6 +205,7 @@ func (p *TextParser) reset(in io.Reader) {
 // startOfLine represents the state where the next byte read from p.buf is the
 // start of a line (or whitespace leading up to it).
 func (p *TextParser) startOfLine() stateFn {
+
 	p.lineCount++
 	if p.skipBlankTab(); p.err != nil {
 		// This is the only place that we expect to see io.EOF,
@@ -213,6 +217,35 @@ func (p *TextParser) startOfLine() stateFn {
 		}
 		return nil
 	}
+
+	// should batch callback
+	if p.currentByte == '#' {
+		if p.batchSize > 0 && p.batchCallback != nil && len(p.metricFamiliesByName) >= p.batchSize {
+			if p.previousByte != '#' {
+				mfs, err := p.returnMetrics()
+				if err != nil {
+					// TODO: should we terminate here?
+				} else {
+					p.batchCallback(mfs)
+
+					// clear memory
+					p.metricFamiliesByName = map[string]*dto.MetricFamily{}
+					p.err = nil
+					p.lineCount = 0
+					if p.summaries == nil || len(p.summaries) > 0 {
+						p.summaries = map[uint64]*dto.Metric{}
+					}
+					if p.histograms == nil || len(p.histograms) > 0 {
+						p.histograms = map[uint64]*dto.Metric{}
+					}
+					p.currentQuantile = math.NaN()
+					p.currentBucket = math.NaN()
+				}
+			}
+		}
+	}
+	p.previousByte = p.currentByte
+
 	switch p.currentByte {
 	case '#':
 		return p.startComment
@@ -558,10 +591,10 @@ func (p *TextParser) startTimestamp() stateFn {
 // readingHelp represents the state where the last byte read (now in
 // p.currentByte) is the first byte of the docstring after 'HELP'.
 func (p *TextParser) readingHelp() stateFn {
-	if p.currentMF.Help != nil {
-		p.parseError(fmt.Sprintf("second HELP line for metric name %q", p.currentMF.GetName()))
-		return nil
-	}
+	// if p.currentMF.Help != nil {
+	// 	p.parseError(fmt.Sprintf("second HELP line for metric name %q", p.currentMF.GetName()))
+	// 	return nil
+	// }
 	// Rest of line is the docstring.
 	if p.readTokenUntilNewline(true); p.err != nil {
 		return nil // Unexpected end of input.
@@ -573,10 +606,10 @@ func (p *TextParser) readingHelp() stateFn {
 // readingType represents the state where the last byte read (now in
 // p.currentByte) is the first byte of the type hint after 'HELP'.
 func (p *TextParser) readingType() stateFn {
-	if p.currentMF.Type != nil {
-		p.parseError(fmt.Sprintf("second TYPE line for metric name %q, or TYPE reported after samples", p.currentMF.GetName()))
-		return nil
-	}
+	// if p.currentMF.Type != nil {
+	// 	p.parseError(fmt.Sprintf("second TYPE line for metric name %q, or TYPE reported after samples", p.currentMF.GetName()))
+	// 	return nil
+	// }
 	// Rest of line is the type.
 	if p.readTokenUntilNewline(false); p.err != nil {
 		return nil // Unexpected end of input.
@@ -587,6 +620,14 @@ func (p *TextParser) readingType() stateFn {
 		return nil
 	}
 	p.currentMF.Type = dto.MetricType(metricType).Enum()
+	if p.currentMF.GetType() == dto.MetricType_INFO {
+		// Add suffix _info if metric name does not end with it.
+		if !strings.HasSuffix(*p.currentMF.Name, "_info") {
+			delete(p.metricFamiliesByName, *p.currentMF.Name)
+			p.currentMF.Name = proto.String(*p.currentMF.Name + "_info")
+			p.metricFamiliesByName[*p.currentMF.Name] = p.currentMF
+		}
+	}
 	return p.startOfLine
 }
 
@@ -775,18 +816,6 @@ func (p *TextParser) setOrCreateCurrentMF() {
 	}
 	p.currentMF = &dto.MetricFamily{Name: proto.String(name)}
 	p.metricFamiliesByName[name] = p.currentMF
-
-	if p.batchSize > 0 && p.batchCallback != nil && len(p.metricFamiliesByName)%p.batchSize == 0 {
-		mfs, err := p.returnMetrics()
-		if err != nil {
-			// TODO: should we terminate here?
-		} else {
-			p.batchCallback(mfs)
-		}
-
-		// clear memory
-		p.metricFamiliesByName = map[string]*dto.MetricFamily{}
-	}
 }
 
 func isValidLabelNameStart(b byte) bool {
